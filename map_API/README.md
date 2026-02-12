@@ -18,7 +18,7 @@ stops along the route based on:
 -   Finds cheapest fuel stations near the route
 -   Proactive refueling using a safety buffer
 -   CSV-based fuel station ingestion
--   Secure configuration using `.env`
+-   Secure configuration using `.env` file
 
 ------------------------------------------------------------------------
 
