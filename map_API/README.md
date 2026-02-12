@@ -1,135 +1,61 @@
-# Fuel Optimized Route Planner (Django + OpenRouteService)
+# What would this route cost in fuel?
 
-This project is a Django REST API that calculates an optimized
-driving route between two locations and determines cost efficient fuel
-stops along the route based on:
+This Django REST endpoint combines an OpenRouteService route with a local table of station prices. It returns route coordinates, selected fuel-stop candidates, distance, and a fuel-cost estimate.
 
--   Vehicle fuel efficiency (MPG)
--   Tank range
--   Fuel station prices (loaded from CSV)
--   Real driving routes from OpenRouteService (ORS)
+The current method walks sampled route segments, normalizes their straight-line lengths to the provider's reported driving distance, and searches for cheaper nearby stations when remaining range falls below a 50-mile buffer. It assumes a full starting tank.
 
-------------------------------------------------------------------------
+It does **not** establish a globally cheapest plan. It does not route detours to stations, validate road access, choose fuel grade, model tank purchase amounts, or prove a station is reachable by road. Sparse geometry that exceeds remaining range is rejected instead of producing an apparently feasible plan. Do not use this prototype as navigation or a guarantee against running out of fuel.
 
-## Features
+## Flow and layout
 
--   Uses OpenRouteService Directions API for accurate driving routes
--   Calculates total distance using ORS data
--   Finds cheapest fuel stations near the route
--   Proactive refueling using a safety buffer
--   CSV-based fuel station ingestion
--   Secure configuration using `.env` file
+```text
+POST /api/route/ → finite coordinate/vehicle validation → ORS Directions
+    → decode route → sample station candidates in PostgreSQL → estimate
+CSV → validated station identity and price → update existing prices
+```
 
-------------------------------------------------------------------------
+- `api/serializers.py`: coordinate bounds, positive bounded MPG/range.
+- `api/views.py`: routing request, segment heuristic, fuel estimate.
+- `api/management/commands/load_fuel_data.py`: atomic CSV import, preserving ZIP-code strings.
+- `fuel_prices_sample.csv`: demonstration rows, not live prices or verified station coverage.
 
-## Tech Stack
+## Run locally
 
--   Python
--   Django
--   Django REST Framework
--   PostgreSQL
--   OpenRouteService API
--   python-dotenv
--   requests
--   polyline
+Use a Python version supported by the declared Django 6 dependencies and a local PostgreSQL database. From this directory:
 
-------------------------------------------------------------------------
-
-
-# Setup Instructions
-
-## Create Virtual Environment
-
-### macOS / Linux
-
-python -m venv venv 
-source venv/bin/activate
-
-### Windows
-
-python -m venv venv 
-venv\Scripts\activate
-
-------------------------------------------------------------------------
-
-## Install Dependencies
-
+```sh
+python -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
+cp .env.example .env
+```
 
-------------------------------------------------------------------------
+Set your own `DB_NAME`, `DB_USER`, `DB_PASSWORD` and `ORS_API_KEY`. The API key must belong to you. Local `DJANGO_DEBUG=true` creates a temporary signing key when none is supplied; with debug disabled, an explicit private `DJANGO_SECRET_KEY` is required. Never commit these values.
 
-# Environment Configuration
-
-Create a `.env` file in the project root:
-
-DB_NAME=fuel_routes DB_USER=postgres DB_PASSWORD=your_password
-DB_HOST=localhost DB_PORT=5432
-
-ORS_API_KEY=your_openrouteservice_key
-
-
-------------------------------------------------------------------------
-
-# Database Setup (PostgreSQL)
-
-## Create Database
-
-CREATE DATABASE fuel_routes;
-
-## Apply Migrations
-
-python manage.py makemigrations python manage.py migrate
-
-------------------------------------------------------------------------
-
-# Get OpenRouteService API Key
-
-1.  Go to https://openrouteservice.org
-2.  Create an account
-3.  Generate a Directions API key
-4.  Add it to `.env`
-
-------------------------------------------------------------------------
-
-# Fuel Stations CSV
-
-Place your CSV file at root level same as the manage.py:
-
-Example CSV format:
-
-station_name,city,state,zip_code,latitude,longitude,fuel_type,price_per_gallon
-Shell,Los Angeles,CA,90001,34.0522,-118.2437,Regular,4.59
-
-
-------------------------------------------------------------------------
-
-# Load Fuel Stations into Database
-
+```sh
+python manage.py migrate
 python manage.py load_fuel_data
+python manage.py runserver 127.0.0.1:8000
+```
 
-------------------------------------------------------------------------
+The importer accepts `--path /path/to/stations.csv`. A station identity includes its name, location, coordinates and fuel type; importing a new price updates that identity. Existing duplicates from old imports need a separate data cleanup. The import does not delete unrelated stations.
 
-# Run Development Server
+## Request and response
 
-python manage.py runserver
+```sh
+curl http://127.0.0.1:8000/api/route/   -H 'Content-Type: application/json'   -d '{"start_lat":34.05,"start_lng":-118.24,"end_lat":34.15,"end_lng":-118.14,"vehicle_mpg":25,"tank_range_miles":400}'
+```
 
-Server will run at: http://127.0.0.1:8000/
+The result has `route` as latitude/longitude pairs, `fuel_stops` with station names/coordinates/prices, `total_distance_miles`, and `total_fuel_cost`. No example dollar amount is presented as a verified journey result.
 
-------------------------------------------------------------------------
+Validation accepts latitude -90–90, longitude -180–180, MPG 1–200, and tank range 51–2000 miles. Identical endpoints are rejected. Missing provider configuration or station prices returns 503; upstream failure or malformed data returns 502; timeout returns 504; insufficient route sampling for a reachable plan returns 422.
 
-# API Endpoint
+## Evidence and next steps
 
-POST /api/route/
+```sh
+python manage.py test api --settings=map_API.test_settings
+```
 
-Request Body:
+Six tests cover numeric bounds, a mocked short route, missing station data, malformed/sparse routes, safe provider errors, and repeat CSV imports. They were verified on an existing Django 4.2 test environment with in-memory SQLite and polyline 2.0.4; the declared Django 6/PostgreSQL stack and live ORS endpoint were not exercised.
 
-{ "start_lat": 34.05233, "start_lng": -118.24356, "end_lat": 40.71278,
-"end_lng": -74.0060}
-
-Response Example:
-
-{ "route": \[\[lat, lng\], ...\], "fuel_stops": \[ { "station_name": "Exxon", "latitude": 39.7392, "longitude": -104.9903, "price_per_gallon": 4.58 } \], "total_distance_miles": 2794.41, "total_fuel_cost": 1075.25 }
-
-
-
-
+Before hosting, add authentication and request/cost limits, cap upstream response bytes and aggregate database work, introduce spatial indexing and candidate prefetching, and evaluate the heuristic against a feasible-route reference solver. The current route can issue many station queries; offsets near the antimeridian need additional geographic handling. Prices are floats and the final segment uses a fallback station price, so the result is a rough consumption estimate rather than a record of purchases. No UI or map screenshot is claimed.

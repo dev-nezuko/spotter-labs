@@ -5,7 +5,7 @@ from rest_framework.views import APIView
 from rest_framework.response import Response
 from .serializers import RouteRequestSerializer
 from .models import FuelStation
-from math import radians, cos, sin, asin, sqrt
+from math import radians, cos, sin, asin, sqrt, isfinite
 
 
 def haversine(lat1, lon1, lat2, lon2):
@@ -15,18 +15,19 @@ def haversine(lat1, lon1, lat2, lon2):
     dlon = lon2 - lon1
     dlat = lat2 - lat1
     angle = sin(dlat / 2) ** 2 + cos(lat1) * cos(lat2) * sin(dlon / 2) ** 2
-    central_angle = 2 * asin(sqrt(angle))
+    central_angle = 2 * asin(sqrt(max(0, min(1, angle))))
     return 3956 * central_angle
 
 def stations_near_point(lat, lng, radius_miles=50):
     """Return fuel stations within radius"""
     
     lat_deg = radius_miles / 69.17
-    lng_deg = radius_miles / (69.17 * cos(radians(lat)))
+    lng_deg = min(180, radius_miles / (69.17 * max(abs(cos(radians(lat))), 1e-9)))
 
     nearby_stations = FuelStation.objects.filter(
         latitude__range=(lat - lat_deg, lat + lat_deg),
-        longitude__range=(lng - lng_deg, lng + lng_deg)
+        longitude__range=(lng - lng_deg, lng + lng_deg),
+        price_per_gallon__gt=0
     )
 
     # Precise haversine check
@@ -41,28 +42,38 @@ class RouteAPIView(APIView):
         start = [data['start_lng'], data['start_lat']]
         end = [data['end_lng'], data['end_lat']]
 
+        if not settings.ORS_API_KEY:
+            return Response({"error": "Routing provider is not configured."}, status=503)
+        if not FuelStation.objects.filter(price_per_gallon__gt=0).exists():
+            return Response({"error": "Load positive station prices before requesting a route."}, status=503)
         route_url = settings.ORS_URL
         try:
             resp = requests.post(
                 route_url,
                 headers={'Authorization': settings.ORS_API_KEY, 'Content-Type': 'application/json'},
                 json={"coordinates": [start, end]},
-                timeout=10
+                timeout=10, allow_redirects=False
             )
             resp.raise_for_status()
             route_resp = resp.json()
         except requests.exceptions.Timeout:
             return Response({"error": "Routing service timed out."}, status=504)
-        except requests.exceptions.RequestException as e:
-            return Response({"error": f"Routing service error: {str(e)}"}, status=502)
+        except (requests.exceptions.RequestException, ValueError):
+            return Response({"error": "Routing provider request failed."}, status=502)
 
-        if "routes" not in route_resp or not route_resp["routes"]:
-            return Response({"error": "No route found."}, status=400)
-
-        route_data = route_resp["routes"][0]
-        actual_distance_meters = route_data["summary"]["distance"]
-        total_distance_miles = actual_distance_meters * 0.000621371
-        route_coords = polyline.decode(route_data["geometry"])
+        try:
+            route_data = route_resp["routes"][0]
+            actual_distance_meters = route_data["summary"]["distance"]
+            if isinstance(actual_distance_meters, bool) or not isinstance(actual_distance_meters, (int, float)) or not isfinite(actual_distance_meters) or actual_distance_meters <= 0:
+                raise ValueError()
+            total_distance_miles = actual_distance_meters * 0.000621371
+            route_coords = polyline.decode(route_data["geometry"])
+            if not 2 <= len(route_coords) <= 10000:
+                raise ValueError()
+            if any(not (len(point) == 2 and isfinite(point[0]) and isfinite(point[1]) and -90 <= point[0] <= 90 and -180 <= point[1] <= 180) for point in route_coords):
+                raise ValueError()
+        except (KeyError, IndexError, TypeError, ValueError, OverflowError):
+            return Response({"error": "Routing provider returned invalid route data."}, status=502)
 
         tank_range = data['tank_range_miles']
         mpg = data['vehicle_mpg']
@@ -91,6 +102,8 @@ class RouteAPIView(APIView):
 
         for i, segment_distance in enumerate(polyline_segments):
             normalized_segment_distance = segment_distance * norm_factor
+            if normalized_segment_distance > remaining_range:
+                return Response({"error": "This route sampling cannot establish reachable fuel stops within the tank range."}, status=422)
             distance_since_refuel += normalized_segment_distance
             remaining_range -= normalized_segment_distance
 
